@@ -1,6 +1,7 @@
 <#
-Baut das Docker-Image mit einer um 1 erhoehten Patch-Version (aus VERSION),
-taggt es als Version und als "latest" und laedt beide Tags zu ghcr.io hoch.
+Baut das Docker-Image fuer linux/amd64 + linux/arm64 (z.B. Raspberry Pi 3
+64-bit) mit einer um 1 erhoehten Patch-Version (aus VERSION), taggt es als
+Version und als "latest" und laedt beide Tags direkt zu ghcr.io hoch.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -8,6 +9,7 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $versionFile = Join-Path $scriptDir "VERSION"
 $imageName = "ghcr.io/blackorca/enpal-mqtt-bridge"
+$platforms = "linux/amd64,linux/arm64"
 
 # --- Version einlesen und Patch hochzaehlen ---
 $currentVersion = (Get-Content $versionFile -Raw).Trim()
@@ -26,32 +28,40 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($revision)) {
 }
 $created = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-Write-Host "Baue $imageName Version $newVersion (Revision $revision) ..."
+# --- Buildx-Builder mit Multi-Platform-Push-Unterstuetzung sicherstellen ---
+# Der Standard-"docker"-Treiber kann kein Multi-Platform-Manifest in einem
+# Durchgang erzeugen/pushen ("Multi-platform build is not supported for the
+# docker driver") - dafuer wird einmalig ein "docker-container"-Builder
+# angelegt und danach wiederverwendet.
+$builderName = "enpal-multiarch"
+docker buildx inspect $builderName 2>$null 1>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Erstelle Buildx-Builder '$builderName' (docker-container-Treiber) ..."
+    docker buildx create --name $builderName --driver docker-container --bootstrap
+    if ($LASTEXITCODE -ne 0) {
+        throw "Konnte Buildx-Builder '$builderName' nicht erstellen (Exit-Code $LASTEXITCODE)"
+    }
+}
 
-docker build `
+Write-Host "Baue und pushe $imageName Version $newVersion fuer $platforms (Revision $revision) ..."
+
+# Multi-Plattform-Images koennen nicht lokal geladen werden - buildx baut
+# und pusht sie direkt als ein gemeinsames Manifest pro Tag zu ghcr.io.
+docker buildx build `
+    --builder $builderName `
+    --platform $platforms `
     --build-arg "VERSION=$newVersion" `
     --build-arg "REVISION=$revision" `
     --build-arg "CREATED=$created" `
     -t "${imageName}:$newVersion" `
     -t "${imageName}:latest" `
+    --push `
     $scriptDir
 if ($LASTEXITCODE -ne 0) {
-    throw "docker build fehlgeschlagen (Exit-Code $LASTEXITCODE)"
+    throw "docker buildx build/push fehlgeschlagen (Exit-Code $LASTEXITCODE) - VERSION bleibt auf $currentVersion, einfach erneut versuchen."
 }
 
-# Build erfolgreich -> Version jetzt erst persistieren, damit ein fehlgeschlagener
-# Build die VERSION-Datei nicht unnoetig hochzaehlt.
+# Build+Push erfolgreich -> Version jetzt erst persistieren.
 Set-Content -Path $versionFile -Value $newVersion -NoNewline -Encoding utf8
 
-Write-Host "Lade ${imageName}:$newVersion und :latest zu ghcr.io hoch ..."
-docker push "${imageName}:$newVersion"
-if ($LASTEXITCODE -ne 0) {
-    throw "docker push fehlgeschlagen (Exit-Code $LASTEXITCODE) - VERSION steht bereits auf $newVersion, Image ist lokal vorhanden und kann erneut gepusht werden."
-}
-
-docker push "${imageName}:latest"
-if ($LASTEXITCODE -ne 0) {
-    throw "docker push von 'latest' fehlgeschlagen (Exit-Code $LASTEXITCODE)"
-}
-
-Write-Host "Fertig: ${imageName}:$newVersion wurde gebaut und hochgeladen."
+Write-Host "Fertig: ${imageName}:$newVersion ($platforms) wurde gebaut und hochgeladen."

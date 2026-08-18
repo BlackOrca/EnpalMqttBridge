@@ -20,13 +20,28 @@ Objekte inkl. Name, Einheit und Gerätklasse automatisch anlegt - siehe
 
 ## Wichtiger Hinweis zum Testgrad
 
-- **Ende-zu-Ende gegen die echte Box getestet:** Läuft auf .NET 10
-  (SDK/Runtime), Microsoft.Playwright 1.62.0 und MQTTnet 5.2.0.
+- **Ende-zu-Ende gegen die echte Box getestet (linux/amd64):** Läuft auf
+  .NET 10 (SDK/Runtime), Microsoft.Playwright 1.62.0 und MQTTnet 5.2.0.
   `dotnet build`/`dotnet publish`, `docker build` und ein kompletter Lauf
   gegen eine echte Enpal-Box + einen lokalen Test-Broker wurden erfolgreich
   durchgeführt: der „Load Current Collector State"-Button liefert
   zuverlässig alle ~69 Sensorwerte (Zahlen wie Text) pro Zyklus, und die
   MQTT-Payloads kommen korrekt formatiert an.
+- **linux/arm64 (z.B. Raspberry Pi 3, 64-bit OS) - Build verifiziert,
+  Laufzeit nicht auf echter Hardware getestet:** Das Image wird als
+  Multi-Platform-Manifest (amd64 + arm64) gebaut, siehe
+  [Raspberry Pi / arm64](#raspberry-pi--arm64). Der arm64-Build wurde
+  erfolgreich durchgeführt und der arm64-Chromium im Playwright-Image
+  läuft eigenstaendig nachweislich. Ein voller Laufzeittest war nur per
+  QEMU-Emulation auf einem amd64-Rechner möglich, und dort stürzt QEMU
+  selbst (nicht die Bridge) beim Zusammenspiel von Node-Treiber und
+  Chromium ab (Segfault in QEMU) - ein bekanntes Limit von
+  QEMU-User-Mode-Emulation für solche Workloads, keine .NET/Playwright-
+  Fehlermeldung. Bitte einmal auf echter Pi-Hardware testen, bevor du dich
+  darauf verlässt (auf echtem Silizium gibt es keine Emulation mehr, die
+  gefundenen Fehlerquellen - falsches Playwright-Treiber-Binary,
+  fehlender `--no-sandbox`/`--disable-dev-shm-usage` - sind bereits
+  behoben).
 
 ## 1. Bridge bauen und starten
 
@@ -91,6 +106,34 @@ automatisch als "nicht verfügbar", sobald die Bridge nicht läuft.
 Per `HA_DISCOVERY_ENABLED=false` lässt sich die Discovery-Veröffentlichung
 komplett abschalten, `HA_DISCOVERY_PREFIX` ändert den Topic-Präfix (Default
 `homeassistant`, wie vom HA-Discovery-Modul in Symcon erwartet).
+
+## Raspberry Pi / arm64
+
+`build-and-push.ps1` baut das Image als Multi-Platform-Manifest fuer
+`linux/amd64` und `linux/arm64` (u.a. Raspberry Pi 3 mit 64-Bit-OS) und
+pusht es in einem Rutsch zu ghcr.io. Da der Standard-„docker"-Buildx-
+Treiber keine Multi-Platform-Pushes unterstuetzt, legt das Skript beim
+ersten Lauf automatisch einen `docker-container`-Builder namens
+`enpal-multiarch` an.
+
+Auf dem Pi selbst reicht danach das normale `docker compose pull && docker
+compose up -d` - Docker waehlt automatisch das passende arm64-Image aus
+dem Manifest aus.
+
+Ein paar arm64-spezifische Anpassungen im Dockerfile/Code:
+
+- Die Build-Stage laeuft immer nativ auf der Architektur des bauenden
+  Rechners (`--platform=$BUILDPLATFORM`), `dotnet publish` wird aber
+  trotzdem explizit mit `-r linux-$TARGETARCH` aufgerufen - sonst landet
+  der falsche (Ziel-)architekturspezifische Playwright-Treiber im Image.
+- `DOTNET_EnableWriteXorExecute=0` (Laufzeit) und `--no-sandbox` /
+  `--disable-dev-shm-usage` beim Chromium-Start vermeiden bekannte
+  Abstuerze von .NET/Chromium in Containern auf ARM-Systemen bzw. mit
+  begrenztem `/dev/shm`.
+
+Der Raspberry Pi 3 hat nur 1 GB RAM - Chromium ist vergleichsweise
+speicherhungrig, daher im Zweifel Swap einrichten und die Bridge im Auge
+behalten (`docker stats`), falls sie unter Last neu startet.
 
 ## Aufbau
 

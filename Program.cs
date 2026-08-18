@@ -60,7 +60,7 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                Log($"Sitzung mit Fehler beendet, starte in {config.RestartDelaySeconds}s neu: {ex.Message}");
+                Log($"Sitzung mit Fehler beendet, starte in {config.RestartDelaySeconds}s neu: {ex}");
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(config.RestartDelaySeconds), cts.Token);
@@ -95,6 +95,10 @@ internal static class Program
         await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
         {
             Headless = true,
+            // Im Container laeuft Chromium als root (kein eigener USER im
+            // Dockerfile) und der Standard-/dev/shm ist mit 64 MB oft zu
+            // klein - beides fuehrt sonst zu Abstuerzen beim Browser-Start.
+            Args = ["--no-sandbox", "--disable-dev-shm-usage"],
         });
         await using var context = await browser.NewContextAsync(new BrowserNewContextOptions
         {
