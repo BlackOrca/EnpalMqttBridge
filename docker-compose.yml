@@ -1,0 +1,7 @@
+services:
+  enpal-mqtt-bridge:
+    build: .
+    container_name: enpal-mqtt-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
