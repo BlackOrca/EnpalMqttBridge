@@ -1,35 +1,32 @@
 # Enpal MQTT Bridge
 
-Liest die Enpal-Box-Seite `deviceMessages` per echtem Headless-Browser
-(Playwright/Chromium) aus - inklusive der Werte, die erst nach Anhaken von
-„Show internal values" / „Show unsupported values" sichtbar werden
+Liest die Enpal-Box-Seite `collector` per echtem Headless-Browser
+(Playwright/Chromium) aus: ein Klick auf „Load Current Collector State"
+liefert ein vollständiges JSON mit allen Sensorwerten - inklusive der
+Werte, die auf der `deviceMessages`-Seite erst nach Anhaken von „Show
+internal values" / „Show unsupported values" sichtbar wären
 (Batterie-Ladezustand/SOC, Batterie laden/entladen, PV-DC-Leistung, ...).
-Diese Checkboxen hängen an einer aktiven Blazor-Server-Verbindung
-(SignalR-Circuit) und sind deshalb per einfachem HTTP-GET/Scraping nicht
+Dieser Button hängt an einer aktiven Blazor-Server-Verbindung
+(SignalR-Circuit) und ist deshalb per einfachem HTTP-GET/Scraping nicht
 erreichbar - deshalb hier ein echter Browser statt eines HTML-Parsers.
+Die Sensornamen im JSON (z.B. `Energy.Battery.Charge.Level`) entsprechen
+denen der bisherigen `deviceMessages`-Tabelle.
 
-Die gefundenen Werte werden per MQTT veröffentlicht; ein separates
-Symcon-Skript (`symcon/enpal_mqtt_receiver.php`) holt sie ab und schreibt
-sie in dieselbe „Enpal-Box"-Instanzstruktur wie das bestehende
-HTML-Scraping-Skript (`enpal_box_optimiert.php`).
+Die gefundenen Werte werden per MQTT veröffentlicht. Zusätzlich sendet die
+Bridge für jeden Sensor eine Home-Assistant-MQTT-Discovery-Konfiguration
+(retained), sodass z.B. das HA-Discovery-Modul in Symcon die passenden
+Objekte inkl. Name, Einheit und Gerätklasse automatisch anlegt - siehe
+[Home-Assistant-MQTT-Discovery](#home-assistant-mqtt-discovery).
 
 ## Wichtiger Hinweis zum Testgrad
 
-- **Build/Docker verifiziert:** Läuft auf .NET 10 (SDK/Runtime), Microsoft.Playwright
-  1.62.0 und MQTTnet 5.2.0. `dotnet build`/`dotnet publish` sowie
-  `docker build` wurden erfolgreich durchgeführt; ein Testcontainer
-  wurde gestartet und Chromium konnte darin erfolgreich launchen und
-  eine Zielseite ansteuern (Verbindungsfehler kam erwartungsgemäß nur,
-  weil im Test keine echte Enpal-Box erreichbar war).
-- **Nicht verifiziert:** Das eigentliche Verhalten gegen eine echte
-  Enpal-Box - insbesondere ob die "Show internal/unsupported values"-
-  Checkboxen zuverlässig erkannt/angeklickt werden und ob danach wirklich
-  alle gewünschten Sensoren (SOC, Batterie laden/entladen, PV-DC-Leistung)
-  im Ergebnis auftauchen. Bitte einmal gegen die echte Box laufen lassen,
-  bevor du dich darauf verlässt.
-- **`symcon/enpal_mqtt_receiver.php` fehlt noch** - im Projektverzeichnis
-  aktuell nicht vorhanden, obwohl weiter unten referenziert. Muss noch
-  ergänzt werden, bevor der Symcon-Teil nutzbar ist.
+- **Ende-zu-Ende gegen die echte Box getestet:** Läuft auf .NET 10
+  (SDK/Runtime), Microsoft.Playwright 1.62.0 und MQTTnet 5.2.0.
+  `dotnet build`/`dotnet publish`, `docker build` und ein kompletter Lauf
+  gegen eine echte Enpal-Box + einen lokalen Test-Broker wurden erfolgreich
+  durchgeführt: der „Load Current Collector State"-Button liefert
+  zuverlässig alle ~69 Sensorwerte (Zahlen wie Text) pro Zyklus, und die
+  MQTT-Payloads kommen korrekt formatiert an.
 
 ## 1. Bridge bauen und starten
 
@@ -41,19 +38,19 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Beim Start öffnet die Bridge die Enpal-Seite, hakt alle „Show internal
-values" / „Show unsupported values" Checkboxen an und beginnt danach,
-den aktuellen Zustand der (weiterhin offenen) Seite alle
-`POLL_INTERVAL_SECONDS` Sekunden auszulesen und zu veröffentlichen. Da
-die Blazor-Verbindung ohnehin laufend Live-Updates in die Seite pusht,
-ist das kein "neu laden", sondern nur ein Auslesen des aktuellen DOM -
-entsprechend leichtgewichtig.
+Beim Start öffnet die Bridge die Collector-Seite der Enpal-Box und klickt
+danach alle `POLL_INTERVAL_SECONDS` Sekunden erneut auf „Load Current
+Collector State", um den zuletzt von der Box gesammelten Sensorstand als
+JSON abzuholen und zu veröffentlichen. Das ist bewusst der passive
+„Load State"-Button statt „Run Collection Cycle" - die Bridge erzwingt
+also keine zusätzliche Geräte-Kommunikation, sondern liest nur aus, was
+die Box ohnehin laufend selbst einsammelt.
 
 Bricht die Verbindung ab (z.B. Netzwerkproblem, Box-Neustart), startet
 die Bridge nach `RESTART_DELAY_SECONDS` automatisch eine komplett neue
-Sitzung (neuer Browser, neue Verbindung, Checkboxen erneut anklicken).
+Sitzung (neuer Browser, neue Verbindung).
 
-## 2. Werte manuell prüfen (ohne Symcon)
+## 2. Werte manuell prüfen
 
 ```bash
 mosquitto_sub -h <MQTT_HOST> -t 'enpal/#' -v
@@ -61,53 +58,66 @@ mosquitto_sub -h <MQTT_HOST> -t 'enpal/#' -v
 
 Jede Nachricht ist ein JSON-Objekt, z.B.:
 
+```text
+enpal/Energy.Battery.Charge.Level {"value":96,"unit":"Percent","timestamp":1734000005}
 ```
-enpal/Energy.Battery.Charge.Level {"value":100,"unit":"%","timestamp":1734000005}
+
+## Home-Assistant-MQTT-Discovery
+
+Für jeden Sensor wird beim ersten Auftreten (pro Bridge-Neustart) einmalig
+eine retained Discovery-Config veröffentlicht:
+
+```text
+homeassistant/sensor/enpal-mqtt-bridge/energy_battery_charge_level/config
+{"name":"Energy Battery Charge Level","unique_id":"enpal-mqtt-bridge_energy_battery_charge_level",
+ "state_topic":"enpal/Energy.Battery.Charge.Level","value_template":"{{ value_json.value }}",
+ "availability_topic":"enpal/status","payload_available":"online","payload_not_available":"offline",
+ "device":{"identifiers":["enpal-mqtt-bridge"],"name":"Enpal Solar","manufacturer":"Enpal","model":"Solar Box"},
+ "unit_of_measurement":"%","device_class":"battery","state_class":"measurement"}
 ```
 
-## 3. Symcon-Skript einrichten
+Alle Sensoren landen dadurch unter einem gemeinsamen Gerät „Enpal Solar".
+`unit_of_measurement`/`device_class`/`state_class` werden automatisch aus
+der von der Box gelieferten Einheit abgeleitet (W/kW → `power`, Wh/kWh →
+`energy` + `total_increasing`, V → `voltage`, A → `current`, Hz →
+`frequency`, Celcius → `temperature`, der Batterie-Ladestand zusätzlich als
+`battery`); Text-Sensoren (LTE-Status etc.) bleiben unklassifiziert.
 
-1. Neues Skript in Symcon anlegen, Inhalt von
-   `symcon/enpal_mqtt_receiver.php` hineinkopieren.
-2. Am Kopf des Skripts die Konstanten `MQTT_HOST`, `MQTT_PORT`,
-   `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TOPIC_PREFIX` an eure Umgebung
-   anpassen (gleiche Werte wie in `.env` der Bridge).
-3. Einen Zeitplan/Ereignis-Trigger einrichten, der das Skript
-   regelmäßig ausführt - empfohlen alle 20-30 Sekunden, passend zu
-   `POLL_INTERVAL_SECONDS` der Bridge.
-4. Nach dem ersten Lauf sollte unter der (bestehenden oder neu
-   angelegten) „Enpal-Box"-Instanz für jeden per MQTT veröffentlichten
-   Sensor eine Unterinstanz mit den Variablen „Wert" / „Zeitstempel" /
-   „Aktuell?" auftauchen - genau wie beim HTML-Scraping-Skript.
+Die Bridge setzt außerdem einen Verfügbarkeits-Status unter `enpal/status`
+(`online` beim Verbinden, `offline` per MQTT-Last-Will bzw. beim sauberen
+Beenden) - Discovery-Objekte zeigen sich dadurch in Symcon/Home Assistant
+automatisch als "nicht verfügbar", sobald die Bridge nicht läuft.
 
-Das Skript bringt (wie das HTML-Skript) eine `IPS_Semaphore`-Sperre
-mit, falls sich zwei Durchläufe mal überlappen sollten.
+Per `HA_DISCOVERY_ENABLED=false` lässt sich die Discovery-Veröffentlichung
+komplett abschalten, `HA_DISCOVERY_PREFIX` ändert den Topic-Präfix (Default
+`homeassistant`, wie vom HA-Discovery-Modul in Symcon erwartet).
 
 ## Aufbau
 
-```
-Dockerfile              Multi-Stage-Build: .NET SDK zum Bauen,
-                         Playwright-Runtime-Image (mit vorinstalliertem
-                         Chromium) zum Ausführen.
-docker-compose.yml       Startet den Container mit den Werten aus .env.
-.env.example              Vorlage für die Konfiguration.
-EnpalMqttBridge.csproj    Projektdatei (Microsoft.Playwright, MQTTnet).
-Program.cs                Kompletter Bridge-Code (Browser-Steuerung,
-                           Parsing, MQTT-Publisher, Reconnect-Logik).
-symcon/
-  enpal_mqtt_receiver.php  Symcon-Skript: verbindet sich kurz per MQTT,
-                            liest retained Nachrichten, schreibt sie in
-                            die Enpal-Box-Instanzstruktur.
+```text
+Dockerfile               Multi-Stage-Build: .NET SDK zum Bauen,
+                          Playwright-Runtime-Image (mit vorinstalliertem
+                          Chromium) zum Ausführen.
+docker-compose.yml        Startet den Container mit den Werten aus .env.
+.env.example               Vorlage für die Konfiguration.
+EnpalMqttBridge.csproj     Projektdatei (Microsoft.Playwright, MQTTnet).
+Program.cs                 Kompletter Bridge-Code (Browser-Steuerung,
+                            Collector-JSON-Parsing, MQTT-Publisher,
+                            Reconnect-Logik).
+VERSION                    Aktuelle Image-Version (SemVer), wird von
+                            build-and-push.ps1 automatisch hochgezählt.
+build-and-push.ps1         Baut das Docker-Image mit hochgezählter
+                            Version und pusht es zu ghcr.io.
 ```
 
 ## Falls Enpal die Seite nochmal ändert
 
-Die Checkbox-Erkennung sucht gezielt nach
-`input[id^='showInternal_']` / `input[id^='showUnsupported_']` und die
-Tabellen-Erkennung nach `tr`-Zeilen mit mindestens 2 `td`-Zellen
-(3 Zellen = "Site Data"-Format mit komplettem Zeitstempel, 4 Zellen =
-Format mit Uhrzeit-ohne-Datum + Notiz-Spalte). Ändert sich das erneut,
-zuerst per `docker compose logs -f` schauen, wie viele Zeilen/Sensoren
-erkannt werden, und bei Bedarf die Selektoren/Regex in `Program.cs`
-(bzw. das PHP-Pendant in `enpal_box_optimiert.php`) anpassen - das
-gleiche Vorgehen wie bei den bisherigen Anpassungen an diesem Projekt.
+Die Bridge klickt gezielt auf `#collectorLoadStateButton` auf der
+`collector`-Seite und liest danach den Inhalt des Monaco-Editors aus
+(`window.monaco.editor.getModels()[0].getValue()`) - das erwartete JSON
+enthält unter `DeviceCollections[].numberDataPoints` /
+`DeviceCollections[].textDataPoints` je Gerät die Sensorwerte (Name ->
+`{timeStampUtcOfMeasurement, unit, value}`). Ändert sich die Seite oder
+das JSON-Format erneut, zuerst per `docker compose logs -f` schauen, wie
+viele Sensorwerte pro Zyklus erkannt werden, und bei Bedarf den Selektor/
+das JSON-Mapping in `Program.cs` anpassen.

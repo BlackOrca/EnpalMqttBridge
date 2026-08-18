@@ -1,6 +1,6 @@
 services:
   enpal-mqtt-bridge:
-    build: .
+    image: ghcr.io/blackorca/enpal-mqtt-bridge:latest
     container_name: enpal-mqtt-bridge
     restart: unless-stopped
     env_file:

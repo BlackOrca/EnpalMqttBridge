@@ -1,25 +1,29 @@
-using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 using Microsoft.Playwright;
 using MQTTnet;
 
 namespace EnpalMqttBridge;
 
 /// <summary>
-/// Liest die Enpal-Box "deviceMessages"-Seite per echtem Headless-Browser
-/// (Playwright) aus, inklusive der Werte, die erst nach Anhaken von
-/// "Show internal values" / "Show unsupported values" sichtbar werden
-/// (Batterie-Ladezustand/SOC, Batterie laden/entladen, PV-DC-Leistung ...).
-/// Diese Checkboxen hängen an einer aktiven Blazor-Server-Verbindung
-/// (SignalR-Circuit) und sind deshalb per einfachem HTTP-GET nicht
-/// erreichbar - deshalb der "echte Browser"-Ansatz statt HTML-Scraping.
+/// Liest die Enpal-Box "collector"-Seite per echtem Headless-Browser
+/// (Playwright) aus: Klick auf "Load Current Collector State" liefert ein
+/// vollstaendiges JSON mit allen Sensorwerten (inkl. Batterie-SOC, Batterie
+/// laden/entladen, PV-DC-Leistung ...) in einem Monaco-Editor. Der Button
+/// haengt an einer aktiven Blazor-Server-Verbindung (SignalR-Circuit) und
+/// ist deshalb per einfachem HTTP-GET nicht erreichbar - deshalb der
+/// "echte Browser"-Ansatz statt HTML-Scraping.
 ///
-/// Die gefundenen Sensorwerte werden per MQTT veröffentlicht (ein JSON-
-/// Payload pro Sensor unter "&lt;prefix&gt;/&lt;Sensorname&gt;"), damit
-/// Symcon sie über die MQTT-Splitter-Instanz übernehmen kann (siehe
-/// enpal_mqtt_receiver.php).
+/// Die gefundenen Sensorwerte werden per MQTT veroeffentlicht (ein JSON-
+/// Payload pro Sensor unter "&lt;prefix&gt;/&lt;Sensorname&gt;"). Die
+/// Sensornamen entsprechen denen der bisherigen "deviceMessages"-Tabelle
+/// (z.B. "Energy.Battery.Charge.Level"). Zusaetzlich veroeffentlicht die
+/// Bridge (sofern nicht per HA_DISCOVERY_ENABLED deaktiviert) fuer jeden
+/// Sensor eine Home-Assistant-MQTT-Discovery-Konfiguration unter
+/// "&lt;HA_DISCOVERY_PREFIX&gt;/sensor/&lt;MQTT_CLIENT_ID&gt;/&lt;objectId&gt;/config",
+/// damit das HA-Discovery-Modul in Symcon (oder Home Assistant selbst) die
+/// Objekte automatisch mit Name, Einheit und Geraeteklasse anlegt.
 /// </summary>
 internal static class Program
 {
@@ -74,9 +78,13 @@ internal static class Program
     }
 
     /// <summary>
-    /// Ein "Session"-Durchlauf: Browser starten, Checkboxen anhaken,
-    /// danach in einer Schleife periodisch den aktuellen DOM-Zustand
-    /// auslesen und veröffentlichen. Bricht die Schleife (Exception) ab,
+    /// Ein "Session"-Durchlauf: Browser starten, Collector-Seite oeffnen,
+    /// danach in einer Schleife periodisch per "Load Current Collector
+    /// State"-Button den zuletzt gesammelten Stand abrufen und
+    /// veroeffentlichen. Bewusst der passive "Load State"-Button statt
+    /// "Run Collection Cycle" - liest nur aus, was die Box ohnehin schon
+    /// eingesammelt hat, statt bei jedem Poll zusaetzlich Geraete-
+    /// Kommunikation zu erzwingen. Bricht die Schleife (Exception) ab,
     /// wird im Aufrufer eine komplett neue Sitzung gestartet (neuer
     /// Browser, neue Verbindung) - robuster als zu versuchen, eine kaputte
     /// Blazor-Verbindung zu reparieren.
@@ -100,25 +108,15 @@ internal static class Program
             WaitUntil = WaitUntilState.NetworkIdle,
             Timeout = 30_000,
         });
-
-        await RevealInternalValuesAsync(page);
+        await page.Locator("#collectorLoadStateButton").WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 });
 
         Log("Verbindung steht, beginne mit periodischem Auslesen.");
 
         while (!token.IsCancellationRequested)
         {
-            var rows = await ReadRowsAsync(page);
-            if (rows.Count == 0)
-            {
-                // Leere Ergebnisse deuten meist auf eine abgebrochene
-                // Blazor-Verbindung hin (z.B. "blazor-error-ui" sichtbar) -
-                // Exception werfen, damit der Aufrufer eine frische Sitzung
-                // startet, statt stumm nichts mehr zu veröffentlichen.
-                throw new InvalidOperationException("Keine Tabellenzeilen gefunden - Verbindung vermutlich verloren.");
-            }
-
-            var readings = ParseRows(rows);
-            Log($"{readings.Count} von {rows.Count} Zeilen erfolgreich geparst.");
+            var json = await LoadCollectorStateAsync(page);
+            var readings = ParseCollectorState(json);
+            Log($"{readings.Count} Sensorwerte aus Collector-JSON geparst.");
 
             foreach (var reading in readings)
             {
@@ -129,155 +127,89 @@ internal static class Program
         }
     }
 
-    /// <summary>
-    /// Hakt alle "Show internal values" / "Show unsupported values"
-    /// Checkboxen an (eine je Geräte-Karte). Das löst je einen Blazor-
-    /// Server-Roundtrip aus, danach zeigt die Seite zusätzliche Sensoren
-    /// wie SOC (Energy.Battery.Charge.Level) an.
-    /// </summary>
-    private static async Task RevealInternalValuesAsync(IPage page)
-    {
-        var checkboxes = page.Locator(
-            "input[type=checkbox][id^='showInternal_'], input[type=checkbox][id^='showUnsupported_']");
-        var count = await checkboxes.CountAsync();
-        Log($"{count} Checkbox(en) für interne/nicht unterstützte Werte gefunden.");
-
-        for (var i = 0; i < count; i++)
-        {
-            var checkbox = checkboxes.Nth(i);
-            if (await checkbox.IsCheckedAsync())
-            {
-                continue;
-            }
-            await checkbox.CheckAsync();
-            // Kleine Pause je Checkbox, damit der Circuit einzeln
-            // reagieren kann statt mehrere Events zu überlappen.
-            await page.WaitForTimeoutAsync(300);
-        }
-
-        // Sammelpause, bis alle Nachlade-Roundtrips durch sind.
-        await page.WaitForTimeoutAsync(1_000);
-    }
+    // Liest den Monaco-Editor-Inhalt der Collector-Seite aus - siehe
+    // window.monaco JS-API, mit der die Seite den Editor selbst befuellt.
+    private const string GetEditorValueScript =
+        "() => (window.monaco && monaco.editor.getModels().length) ? monaco.editor.getModels()[0].getValue() : null";
 
     /// <summary>
-    /// Liest alle Tabellenzeilen mit mindestens 2 &lt;td&gt;-Zellen in
-    /// einem einzigen Browser-Roundtrip aus (schneller/robuster als pro
-    /// Zeile einzeln über die Playwright-API zu gehen).
+    /// Klickt "Load Current Collector State" und wartet, bis der Monaco-
+    /// Editor daraufhin (per Blazor-Server-Roundtrip) mit JSON befuellt
+    /// wurde.
     /// </summary>
-    private static async Task<List<List<string>>> ReadRowsAsync(IPage page)
+    private static async Task<string> LoadCollectorStateAsync(IPage page)
     {
-        const string script = """
-            () => {
-                const rows = [];
-                document.querySelectorAll('tr').forEach(tr => {
-                    const tds = Array.from(tr.querySelectorAll('td'));
-                    if (tds.length < 2) return;
-                    rows.push(tds.map(td => td.textContent.trim().replace(/\s+/g, ' ')));
-                });
-                return rows;
-            }
-            """;
+        await page.Locator("#collectorLoadStateButton").ClickAsync();
 
-        var result = await page.EvaluateAsync<List<List<string>>>(script);
-        return result ?? new List<List<string>>();
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            await page.WaitForTimeoutAsync(500);
+            var content = await page.EvaluateAsync<string?>(GetEditorValueScript);
+            if (!string.IsNullOrWhiteSpace(content) && content.TrimStart().StartsWith('{'))
+            {
+                return content;
+            }
+        }
+
+        throw new InvalidOperationException("Kein Collector-JSON erhalten - Verbindung vermutlich verloren.");
     }
 
-    // Gleiche Logik wie im begleitenden Symcon-PHP-Skript: die Box nutzt
-    // zwei Tabellenformate parallel (siehe dortige Kommentare).
-    private static readonly Regex ValueRegex =
-        new(@"^([\d.\-]+)\s*(Wh|kWh|kW|W|Hz|°C|%|V|A)$", RegexOptions.Compiled);
-
-    private static readonly Regex SiteDataTimestampRegex =
-        new(@"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z", RegexOptions.Compiled);
-
-    private static readonly Regex TimeOnlyRegex =
-        new(@"^(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", RegexOptions.Compiled);
-
-    private static List<SensorReading> ParseRows(List<List<string>> rows)
+    private static readonly JsonSerializerOptions CollectorJsonOptions = new()
     {
-        var readings = new List<SensorReading>();
+        PropertyNameCaseInsensitive = true,
+    };
 
-        foreach (var cells in rows)
-        {
-            if (cells.Count < 3)
-            {
-                continue; // Notiz-/Fehlerzeile ohne Messwert (2 Zellen) - überspringen.
-            }
-
-            var name = cells[0];
-            var rawValue = cells.Count > 1 ? cells[1] : string.Empty;
-
-            DateTimeOffset? timestamp = cells.Count == 3
-                ? ParseSiteDataTimestamp(cells[2])
-                : cells.Count == 4
-                    ? ParseTimeOnlyTimestamp(cells[2])
-                    : null;
-
-            if (timestamp is null)
-            {
-                continue;
-            }
-
-            var match = ValueRegex.Match(rawValue);
-            if (!match.Success)
-            {
-                continue;
-            }
-
-            if (!double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-            {
-                continue;
-            }
-
-            readings.Add(new SensorReading(name, value, match.Groups[2].Value, timestamp.Value));
-        }
-
-        return readings;
-    }
-
-    private static DateTimeOffset? ParseSiteDataTimestamp(string raw)
+    /// <summary>
+    /// Extrahiert alle Sensorwerte aus den Geraete-Sektionen
+    /// (DeviceCollections[].numberDataPoints/textDataPoints) des Collector-
+    /// JSON. Mehrere Geraete spiegeln teils dieselben Werte (z.B. Batterie-
+    /// Werte tauchen sowohl bei "Battery" als auch bei "Inverter" auf) -
+    /// bei doppelten Sensornamen gewinnt der letzte Eintrag, die Werte sind
+    /// ohnehin identisch.
+    /// </summary>
+    private static List<SensorReading> ParseCollectorState(string json)
     {
-        var match = SiteDataTimestampRegex.Match(raw.Trim());
-        if (!match.Success)
+        var state = JsonSerializer.Deserialize<CollectorState>(json, CollectorJsonOptions);
+        var readings = new Dictionary<string, SensorReading>();
+
+        foreach (var device in state?.DeviceCollections ?? [])
         {
-            return null;
+            foreach (var (name, point) in device.NumberDataPoints ?? [])
+            {
+                readings[name] = new SensorReading(name, point.Value, point.Unit, point.Timestamp);
+            }
+
+            foreach (var (name, point) in device.TextDataPoints ?? [])
+            {
+                readings[name] = new SensorReading(name, point.Value, point.Unit, point.Timestamp);
+            }
         }
 
-        var iso = $"{match.Groups[1].Value}T{match.Groups[2].Value}Z";
-        return DateTimeOffset.TryParse(iso, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dt)
-            ? dt
-            : null;
-    }
-
-    private static DateTimeOffset? ParseTimeOnlyTimestamp(string raw)
-    {
-        var match = TimeOnlyRegex.Match(raw.Trim());
-        if (!match.Success)
-        {
-            return null;
-        }
-
-        var today = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        var iso = $"{today}T{match.Groups[1].Value}Z";
-        if (!DateTimeOffset.TryParse(iso, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var dt))
-        {
-            return null;
-        }
-
-        // Mitternachts-Sprung korrigieren (siehe PHP-Skript für Details).
-        if (dt > DateTimeOffset.UtcNow.AddSeconds(300))
-        {
-            dt = dt.AddDays(-1);
-        }
-
-        return dt;
+        return [.. readings.Values];
     }
 
     private static void Log(string message) =>
         Console.WriteLine($"{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC | {message}");
 }
 
-internal sealed record SensorReading(string Name, double Value, string Unit, DateTimeOffset Timestamp);
+internal sealed record SensorReading(string Name, object Value, string Unit, DateTimeOffset Timestamp);
+
+internal sealed record CollectorState(
+    [property: JsonPropertyName("DeviceCollections")] List<DeviceCollection>? DeviceCollections);
+
+internal sealed record DeviceCollection(
+    [property: JsonPropertyName("numberDataPoints")] Dictionary<string, NumberDataPoint>? NumberDataPoints,
+    [property: JsonPropertyName("textDataPoints")] Dictionary<string, TextDataPoint>? TextDataPoints);
+
+internal sealed record NumberDataPoint(
+    [property: JsonPropertyName("timeStampUtcOfMeasurement")] DateTimeOffset Timestamp,
+    [property: JsonPropertyName("unit")] string Unit,
+    [property: JsonPropertyName("value")] double Value);
+
+internal sealed record TextDataPoint(
+    [property: JsonPropertyName("timeStampUtcOfMeasurement")] DateTimeOffset Timestamp,
+    [property: JsonPropertyName("unit")] string Unit,
+    [property: JsonPropertyName("value")] string Value);
 
 internal sealed class BridgeConfig
 {
@@ -290,12 +222,14 @@ internal sealed class BridgeConfig
     public required string MqttTopicPrefix { get; init; }
     public required int PollIntervalSeconds { get; init; }
     public required int RestartDelaySeconds { get; init; }
+    public required bool HaDiscoveryEnabled { get; init; }
+    public required string HaDiscoveryPrefix { get; init; }
 
     public static BridgeConfig FromEnvironment()
     {
         return new BridgeConfig
         {
-            EnpalUrl = GetEnv("ENPAL_URL", "http://10.1.2.11/deviceMessages"),
+            EnpalUrl = GetEnv("ENPAL_URL", "http://10.1.2.11/collector"),
             MqttHost = GetEnv("MQTT_HOST", "localhost"),
             MqttPort = int.TryParse(GetEnv("MQTT_PORT", "1883"), out var p) ? p : 1883,
             MqttUsername = Environment.GetEnvironmentVariable("MQTT_USERNAME"),
@@ -304,6 +238,8 @@ internal sealed class BridgeConfig
             MqttTopicPrefix = GetEnv("MQTT_TOPIC_PREFIX", "enpal"),
             PollIntervalSeconds = int.TryParse(GetEnv("POLL_INTERVAL_SECONDS", "20"), out var i) ? i : 20,
             RestartDelaySeconds = int.TryParse(GetEnv("RESTART_DELAY_SECONDS", "15"), out var r) ? r : 15,
+            HaDiscoveryEnabled = bool.TryParse(GetEnv("HA_DISCOVERY_ENABLED", "true"), out var d) ? d : true,
+            HaDiscoveryPrefix = GetEnv("HA_DISCOVERY_PREFIX", "homeassistant"),
         };
     }
 
@@ -311,7 +247,8 @@ internal sealed class BridgeConfig
     {
         Console.WriteLine(
             $"Konfiguration: ENPAL_URL={EnpalUrl}, MQTT={MqttHost}:{MqttPort}, " +
-            $"Topic-Prefix={MqttTopicPrefix}, Intervall={PollIntervalSeconds}s");
+            $"Topic-Prefix={MqttTopicPrefix}, Intervall={PollIntervalSeconds}s, " +
+            $"HA-Discovery={(HaDiscoveryEnabled ? $"an ({HaDiscoveryPrefix})" : "aus")}");
     }
 
     private static string GetEnv(string name, string fallback) =>
@@ -322,16 +259,24 @@ internal sealed class MqttPublisher
 {
     private readonly BridgeConfig _config;
     private readonly IMqttClient _client;
+    private readonly HashSet<string> _discoveredSensors = [];
+    private readonly string _statusTopic;
 
     public MqttPublisher(BridgeConfig config)
     {
         _config = config;
         _client = new MqttClientFactory().CreateMqttClient();
+        _statusTopic = $"{_config.MqttTopicPrefix}/status";
     }
 
     public async Task PublishAsync(SensorReading reading, CancellationToken token)
     {
         await EnsureConnectedAsync(token);
+
+        if (_config.HaDiscoveryEnabled && _discoveredSensors.Add(reading.Name))
+        {
+            await PublishDiscoveryConfigAsync(reading, token);
+        }
 
         var topic = $"{_config.MqttTopicPrefix}/{SanitizeTopicSegment(reading.Name)}";
         var payload = JsonSerializer.Serialize(new
@@ -341,15 +286,83 @@ internal sealed class MqttPublisher
             timestamp = reading.Timestamp.ToUnixTimeSeconds(),
         });
 
-        var message = new MqttApplicationMessageBuilder()
-            .WithTopic(topic)
-            .WithPayload(payload)
-            .WithRetainFlag(true)
-            .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
-            .Build();
-
-        await _client.PublishAsync(message, token);
+        await PublishRawAsync(topic, payload, token);
     }
+
+    /// <summary>
+    /// Veroeffentlicht die Home-Assistant-MQTT-Discovery-Konfiguration fuer
+    /// einen Sensor (rueckwirkungskompatibel zum HA-Discovery-Modul in
+    /// Symcon, das dieselben retained Config-Topics auswertet). Wird pro
+    /// Sensorname nur einmal pro Prozesslaufzeit gesendet - der Broker haelt
+    /// die restlichen Nachrichten ohnehin retained vor.
+    /// </summary>
+    private async Task PublishDiscoveryConfigAsync(SensorReading reading, CancellationToken token)
+    {
+        var objectId = ToObjectId(reading.Name);
+        var (unit, deviceClass, stateClass) = ClassifyReading(reading);
+
+        var payload = new Dictionary<string, object>
+        {
+            ["name"] = reading.Name.Replace('.', ' '),
+            ["unique_id"] = $"{_config.MqttClientId}_{objectId}",
+            ["state_topic"] = $"{_config.MqttTopicPrefix}/{SanitizeTopicSegment(reading.Name)}",
+            ["value_template"] = "{{ value_json.value }}",
+            ["availability_topic"] = _statusTopic,
+            ["payload_available"] = "online",
+            ["payload_not_available"] = "offline",
+            ["device"] = new Dictionary<string, object>
+            {
+                ["identifiers"] = new[] { _config.MqttClientId },
+                ["name"] = "Enpal Solar",
+                ["manufacturer"] = "Enpal",
+                ["model"] = "Solar Box",
+            },
+        };
+
+        if (unit is not null)
+        {
+            payload["unit_of_measurement"] = unit;
+        }
+        if (deviceClass is not null)
+        {
+            payload["device_class"] = deviceClass;
+        }
+        if (stateClass is not null)
+        {
+            payload["state_class"] = stateClass;
+        }
+
+        var configTopic = $"{_config.HaDiscoveryPrefix}/sensor/{_config.MqttClientId}/{objectId}/config";
+        await PublishRawAsync(configTopic, JsonSerializer.Serialize(payload), token);
+    }
+
+    // Ordnet einer Box-Einheit die passende(n) Home-Assistant-Metadaten zu.
+    // Textwerte (LTE-Status etc.) bleiben unklassifiziert - ganz normale
+    // Text-Sensoren ohne Einheit/Geraeteklasse.
+    private static (string? Unit, string? DeviceClass, string? StateClass) ClassifyReading(SensorReading reading)
+    {
+        if (reading.Value is string)
+        {
+            return (null, null, null);
+        }
+
+        return reading.Unit switch
+        {
+            "W" or "kW" => (reading.Unit, "power", "measurement"),
+            "Wh" or "kWh" => (reading.Unit, "energy", "total_increasing"),
+            "V" => ("V", "voltage", "measurement"),
+            "A" => ("A", "current", "measurement"),
+            "Hz" => ("Hz", "frequency", "measurement"),
+            "Celcius" => ("°C", "temperature", "measurement"),
+            "Percent" when reading.Name == "Energy.Battery.Charge.Level" => ("%", "battery", "measurement"),
+            "Percent" => ("%", null, "measurement"),
+            _ => (null, null, null),
+        };
+    }
+
+    // Home-Assistant-Discovery-Objekt-IDs duerfen nur a-z/0-9/_ enthalten.
+    private static string ToObjectId(string sensorName) =>
+        new(sensorName.ToLowerInvariant().Select(c => char.IsAsciiLetterOrDigit(c) ? c : '_').ToArray());
 
     private async Task EnsureConnectedAsync(CancellationToken token)
     {
@@ -361,7 +374,11 @@ internal sealed class MqttPublisher
         var optionsBuilder = new MqttClientOptionsBuilder()
             .WithTcpServer(_config.MqttHost, _config.MqttPort)
             .WithClientId(_config.MqttClientId)
-            .WithCleanSession();
+            .WithCleanSession()
+            .WithWillTopic(_statusTopic)
+            .WithWillPayload("offline")
+            .WithWillRetain(true)
+            .WithWillQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce);
 
         if (!string.IsNullOrEmpty(_config.MqttUsername))
         {
@@ -369,6 +386,19 @@ internal sealed class MqttPublisher
         }
 
         await _client.ConnectAsync(optionsBuilder.Build(), token);
+        await PublishRawAsync(_statusTopic, "online", token);
+    }
+
+    private async Task PublishRawAsync(string topic, string payload, CancellationToken token)
+    {
+        var message = new MqttApplicationMessageBuilder()
+            .WithTopic(topic)
+            .WithPayload(payload)
+            .WithRetainFlag(true)
+            .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
+            .Build();
+
+        await _client.PublishAsync(message, token);
     }
 
     private static string SanitizeTopicSegment(string name) =>
@@ -378,6 +408,7 @@ internal sealed class MqttPublisher
     {
         if (_client.IsConnected)
         {
+            await PublishRawAsync(_statusTopic, "offline", CancellationToken.None);
             await _client.DisconnectAsync();
         }
         _client.Dispose();

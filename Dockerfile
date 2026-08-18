@@ -21,7 +21,7 @@ LABEL org.opencontainers.image.title="Enpal MQTT Bridge" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.source="https://github.com/blackorca/enpal-mqtt-bridge"
+      org.opencontainers.image.source="https://github.com/BlackOrca/EnpalMqttBridge"
 
 WORKDIR /app
 COPY --from=build /app .
