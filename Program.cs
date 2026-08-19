@@ -226,6 +226,7 @@ internal sealed class BridgeConfig
     public required string MqttTopicPrefix { get; init; }
     public required int PollIntervalSeconds { get; init; }
     public required int RestartDelaySeconds { get; init; }
+    public required int MqttOperationTimeoutSeconds { get; init; }
     public required bool HaDiscoveryEnabled { get; init; }
     public required string HaDiscoveryPrefix { get; init; }
 
@@ -242,6 +243,7 @@ internal sealed class BridgeConfig
             MqttTopicPrefix = GetEnv("MQTT_TOPIC_PREFIX", "enpal"),
             PollIntervalSeconds = int.TryParse(GetEnv("POLL_INTERVAL_SECONDS", "20"), out var i) ? i : 20,
             RestartDelaySeconds = int.TryParse(GetEnv("RESTART_DELAY_SECONDS", "15"), out var r) ? r : 15,
+            MqttOperationTimeoutSeconds = int.TryParse(GetEnv("MQTT_OPERATION_TIMEOUT_SECONDS", "20"), out var m) ? m : 20,
             HaDiscoveryEnabled = bool.TryParse(GetEnv("HA_DISCOVERY_ENABLED", "true"), out var d) ? d : true,
             HaDiscoveryPrefix = GetEnv("HA_DISCOVERY_PREFIX", "homeassistant"),
         };
@@ -252,6 +254,7 @@ internal sealed class BridgeConfig
         Console.WriteLine(
             $"Konfiguration: ENPAL_URL={EnpalUrl}, MQTT={MqttHost}:{MqttPort}, " +
             $"Topic-Prefix={MqttTopicPrefix}, Intervall={PollIntervalSeconds}s, " +
+            $"MQTT-Operation-Timeout={MqttOperationTimeoutSeconds}s, " +
             $"HA-Discovery={(HaDiscoveryEnabled ? $"an ({HaDiscoveryPrefix})" : "aus")}");
     }
 
@@ -378,6 +381,14 @@ internal sealed class MqttPublisher
         var optionsBuilder = new MqttClientOptionsBuilder()
             .WithTcpServer(_config.MqttHost, _config.MqttPort)
             .WithClientId(_config.MqttClientId)
+            // MQTTnet verwendet standardmaessig MQTT 5.0.0 - Symcons
+            // MQTT-Server-Modul (und viele andere einfache/eingebettete
+            // Broker) sprechen aber nur MQTT 3.1.1. Ein v5-CONNECT-Paket
+            // gegen so einen Broker wird dort offenbar nicht als Fehler
+            // abgelehnt, sondern beantwortet gar nicht erst - genau das
+            // "TCP offen, aber MQTT-Handshake haengt"-Verhalten, das wir
+            // beobachtet haben.
+            .WithProtocolVersion(MQTTnet.Formatter.MqttProtocolVersion.V311)
             .WithCleanSession()
             .WithWillTopic(_statusTopic)
             .WithWillPayload("offline")
@@ -389,7 +400,10 @@ internal sealed class MqttPublisher
             optionsBuilder = optionsBuilder.WithCredentials(_config.MqttUsername, _config.MqttPassword);
         }
 
-        await _client.ConnectAsync(optionsBuilder.Build(), token);
+        await WithTimeoutAsync(
+            ct => _client.ConnectAsync(optionsBuilder.Build(), ct),
+            "Verbindungsaufbau",
+            token);
         await PublishRawAsync(_statusTopic, "online", token);
     }
 
@@ -402,7 +416,49 @@ internal sealed class MqttPublisher
             .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtLeastOnce)
             .Build();
 
-        await _client.PublishAsync(message, token);
+        await WithTimeoutAsync(
+            ct => _client.PublishAsync(message, ct),
+            $"Publish auf '{topic}'",
+            token);
+    }
+
+    /// <summary>
+    /// MQTTnet-Operationen (Connect/Publish) haengen im Feld beobachtet
+    /// teils stunden- statt sekundenlang fest (z.B. wenn ein TCP-Handshake
+    /// zum Broker nie sauber abgelehnt, aber auch nie beantwortet wird) -
+    /// das eingebaute MQTTnet-Timeout (Default 100s) greift dabei nicht
+    /// zuverlaessig, da es offenbar nicht die komplette Verbindungs-
+    /// aufbauphase abdeckt. Deshalb hier ein eigener, garantierter
+    /// Timeout: bricht per CancellationToken ab (das entspricht genau dem
+    /// Verhalten, das ein SIGTERM ohnehin schon zuverlaessig ausloest -
+    /// nur eben nach MqttOperationTimeoutSeconds statt erst beim
+    /// Herunterfahren) und wirft danach eine aussagekraeftige Exception,
+    /// die die Session-Restart-Logik in Main() greifen laesst.
+    /// </summary>
+    private async Task<T> WithTimeoutAsync<T>(Func<CancellationToken, Task<T>> action, string operationName, CancellationToken token)
+    {
+        var timeout = TimeSpan.FromSeconds(_config.MqttOperationTimeoutSeconds);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        cts.CancelAfter(timeout);
+        try
+        {
+            return await action(cts.Token);
+        }
+        // MQTTnet wandelt eine waehrend Connect/Authenticate per Cancellation
+        // abgebrochene Operation nicht in ein sauberes OperationCanceledException
+        // um, sondern in eine MqttConnectingFailedException/-CommunicationException
+        // ("Connection closed") - identisch zu dem, was ein echter Broker bei
+        // z.B. abgelehnter Authentifizierung werfen wuerde. Deshalb hier statt
+        // eines Typ-Filters ueber cts.IsCancellationRequested pruefen, ob
+        // *unser* Timeout (nicht der externe token) die Ursache war, und das im
+        // Log unmissverstaendlich von einer echten Broker-Ablehnung abgrenzen.
+        catch (Exception ex) when (cts.IsCancellationRequested && !token.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"MQTT '{operationName}' nach {timeout.TotalSeconds:0}s abgebrochen - Broker antwortet nicht " +
+                $"(kein echter Ablehnungsgrund, reines Timeout). Letzte Exception dabei: {ex.GetType().Name}: {ex.Message}",
+                ex);
+        }
     }
 
     private static string SanitizeTopicSegment(string name) =>

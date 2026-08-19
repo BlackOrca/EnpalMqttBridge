@@ -65,6 +65,13 @@ Bricht die Verbindung ab (z.B. Netzwerkproblem, Box-Neustart), startet
 die Bridge nach `RESTART_DELAY_SECONDS` automatisch eine komplett neue
 Sitzung (neuer Browser, neue Verbindung).
 
+Jeder MQTT-Connect/Publish wird nach `MQTT_OPERATION_TIMEOUT_SECONDS`
+(Default 20s) hart abgebrochen, falls der Broker nicht antwortet - ohne
+diesen Timeout kann eine TCP-Verbindung, die weder sauber abgelehnt noch
+beantwortet wird, die Bridge stunden- statt sekundenlang blockieren, da
+MQTTnets eingebautes Timeout (Default 100s) diesen Fall nicht zuverlässig
+abdeckt.
+
 ## 2. Werte manuell prüfen
 
 ```bash
