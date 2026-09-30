@@ -196,10 +196,63 @@ EOF
 
 cat > "$UPDATE_CMD" <<EOF
 #!/usr/bin/env bash
-# Aktualisiert die Enpal MQTT Bridge auf das neueste Release.
+# Installiert die Enpal MQTT Bridge neu vom neuesten Release (auch wenn
+# die Version gleich ist). Fuer das normale Update: "update".
 exec bash -c "\$(curl -fsSL https://raw.githubusercontent.com/$REPO/main/lxc/install.sh)"
 EOF
 chmod 755 "$UPDATE_CMD"
+
+# "update" wie bei den Proxmox-Community-Scripts: System-Pakete
+# aktualisieren und danach auf eine neue Bridge-Version pruefen.
+{
+    echo '#!/usr/bin/env bash'
+    echo "REPO=$REPO"
+    echo "APP_DIR=$APP_DIR"
+    echo "SERVICE=$SERVICE"
+    cat <<'EOF'
+# System-Pakete aktualisieren und auf eine neue Version der Enpal MQTT
+# Bridge pruefen (angelegt von lxc/install.sh).
+set -euo pipefail
+
+msg()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "Bitte als root ausfuehren."
+export DEBIAN_FRONTEND=noninteractive
+
+msg "Aktualisiere System-Pakete ..."
+apt-get update
+apt-get -y -o Dpkg::Options::=--force-confold upgrade
+apt-get -y autoremove
+
+msg "Pruefe auf neue Version der Enpal MQTT Bridge ..."
+installed=$(cat "$APP_DIR/VERSION" 2>/dev/null || true)
+# /releases/latest leitet auf .../releases/tag/v<Version> weiter - kommt
+# ohne GitHub-API (und deren Rate-Limit) aus.
+latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") \
+    || die "Konnte die neueste Version nicht ermitteln (GitHub nicht erreichbar?)."
+latest=${latest_url##*/tag/v}
+[ "$latest" != "$latest_url" ] || die "Unerwartete Antwort von GitHub: $latest_url"
+
+if [ "$installed" = "$latest" ]; then
+    msg "Enpal MQTT Bridge ist aktuell (Version $installed)."
+    # Nach einem System-Update laufen neue Chromium-Sitzungen ohnehin mit
+    # den neuen Bibliotheken; ein Neustart ist nur noetig, falls apt das
+    # verlangt (siehe /var/run/reboot-required).
+else
+    msg "Neue Version $latest verfuegbar (installiert: ${installed:-keine}) - aktualisiere ..."
+    bash -c "$(curl -fsSL "https://raw.githubusercontent.com/$REPO/main/lxc/install.sh")"
+fi
+
+[ -f /var/run/reboot-required ] && msg "Hinweis: apt empfiehlt einen Neustart des Containers."
+status=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+msg "Fertig. Status der Bridge: ${status:-unbekannt}"
+EOF
+} > /usr/bin/update.new
+chmod 755 /usr/bin/update.new
+# Per mv ersetzen statt ueberschreiben: laeuft gerade "update" (das dieses
+# Skript aufruft), liest bash dessen alte Datei ungestoert zu Ende.
+mv -f /usr/bin/update.new /usr/bin/update
 
 if [ "$HAS_SYSTEMD" = 1 ]; then
     systemctl daemon-reload
@@ -214,6 +267,6 @@ cat <<EOF
 
   Logs anzeigen:          journalctl -u $SERVICE -f
   Konfiguration:          $CONFIG_FILE  (danach: systemctl restart $SERVICE)
-  Auf neueste Version:    enpal-bridge-update
+  System + Bridge updaten: update
 
 EOF

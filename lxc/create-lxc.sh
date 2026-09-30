@@ -199,6 +199,6 @@ cat <<EOF
   Logs anzeigen:          pct exec $CTID -- journalctl -u enpal-mqtt-bridge -f
   Konfiguration aendern:  pct exec $CTID -- nano /etc/enpal-mqtt-bridge/bridge.env
                           pct exec $CTID -- systemctl restart enpal-mqtt-bridge
-  Auf neueste Version:    pct exec $CTID -- enpal-bridge-update
+  System + Bridge updaten: pct exec $CTID -- update  (oder "update" in der Container-Konsole)
 
 EOF

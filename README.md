@@ -122,7 +122,8 @@ Im Container dann:
 | --- | --- |
 | Logs anzeigen | `journalctl -u enpal-mqtt-bridge -f` |
 | Konfiguration | `/etc/enpal-mqtt-bridge/bridge.env` (gleiche Werte wie `.env.example`), danach `systemctl restart enpal-mqtt-bridge` |
-| Update auf neueste Version | `enpal-bridge-update` (Konfiguration bleibt erhalten) |
+| System + Bridge updaten | `update` - wie bei den Community-Scripts: `apt update` + `apt upgrade`, danach Prüfung auf ein neues Bridge-Release und ggf. Update (Konfiguration bleibt erhalten) |
+| Bridge erzwungen neu installieren | `enpal-bridge-update` |
 
 Vom Proxmox-Host aus geht das jeweils mit vorangestelltem
 `pct exec <CTID> -- ...`.
