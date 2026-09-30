@@ -1,24 +1,29 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Microsoft.Playwright;
 using MQTTnet;
 
 namespace EnpalMqttBridge;
 
 /// <summary>
-/// Liest die Enpal-Box "collector"-Seite per echtem Headless-Browser
-/// (Playwright) aus: Klick auf "Load Current Collector State" liefert ein
-/// vollstaendiges JSON mit allen Sensorwerten (inkl. Batterie-SOC, Batterie
-/// laden/entladen, PV-DC-Leistung ...) in einem Monaco-Editor. Der Button
-/// haengt an einer aktiven Blazor-Server-Verbindung (SignalR-Circuit) und
-/// ist deshalb per einfachem HTTP-GET nicht erreichbar - deshalb der
+/// Liest die Enpal-Box "deviceMessages"-Seite per echtem Headless-Browser
+/// (Playwright) aus. Die Seite zeigt pro Geraet (SiteData, Battery,
+/// Inverter, ...) eine Tabelle mit allen Sensorwerten, die sich ueber eine
+/// Blazor-Server-Verbindung (SignalR-Circuit) live aktualisiert. Erst mit
+/// angehaktem "Show internal values" erscheinen auch Batterie-SOC,
+/// Batterie laden/entladen, PV-DC-Leistung usw. - diese Checkboxen und
+/// die Live-Aktualisierung gibt es nur mit aktivem Circuit, deshalb der
 /// "echte Browser"-Ansatz statt HTML-Scraping.
 ///
+/// Bis Firmware 8.51.4 (09/2026) gab es dafuer die "collector"-Seite mit
+/// einem JSON-Export ("Load Current Collector State"); die hat Enpal
+/// entfernt ("/collector" leitet seitdem auf "/" um).
+///
 /// Die gefundenen Sensorwerte werden per MQTT veroeffentlicht (ein JSON-
-/// Payload pro Sensor unter "&lt;prefix&gt;/&lt;Sensorname&gt;"). Die
-/// Sensornamen entsprechen denen der bisherigen "deviceMessages"-Tabelle
-/// (z.B. "Energy.Battery.Charge.Level"). Zusaetzlich veroeffentlicht die
+/// Payload pro Sensor unter "&lt;prefix&gt;/&lt;Sensorname&gt;", z.B.
+/// "Energy.Battery.Charge.Level"). Zusaetzlich veroeffentlicht die
 /// Bridge (sofern nicht per HA_DISCOVERY_ENABLED deaktiviert) fuer jeden
 /// Sensor eine Home-Assistant-MQTT-Discovery-Konfiguration unter
 /// "&lt;HA_DISCOVERY_PREFIX&gt;/sensor/&lt;MQTT_CLIENT_ID&gt;/&lt;objectId&gt;/config",
@@ -78,14 +83,13 @@ internal static class Program
     }
 
     /// <summary>
-    /// Ein "Session"-Durchlauf: Browser starten, Collector-Seite oeffnen,
-    /// danach in einer Schleife periodisch per "Load Current Collector
-    /// State"-Button den zuletzt gesammelten Stand abrufen und
-    /// veroeffentlichen. Bewusst der passive "Load State"-Button statt
-    /// "Run Collection Cycle" - liest nur aus, was die Box ohnehin schon
-    /// eingesammelt hat, statt bei jedem Poll zusaetzlich Geraete-
-    /// Kommunikation zu erzwingen. Bricht die Schleife (Exception) ab,
-    /// wird im Aufrufer eine komplett neue Sitzung gestartet (neuer
+    /// Ein "Session"-Durchlauf: Browser starten, deviceMessages-Seite
+    /// oeffnen, alle Werte einblenden und danach in einer Schleife
+    /// periodisch den (von der Box live aktualisierten) Tabelleninhalt
+    /// auslesen und veroeffentlichen. Die Bridge liest dabei nur, was die
+    /// Box ohnehin laufend selbst einsammelt - sie erzwingt keine
+    /// zusaetzliche Geraete-Kommunikation. Bricht die Schleife (Exception)
+    /// ab, wird im Aufrufer eine komplett neue Sitzung gestartet (neuer
     /// Browser, neue Verbindung) - robuster als zu versuchen, eine kaputte
     /// Blazor-Verbindung zu reparieren.
     /// </summary>
@@ -106,21 +110,45 @@ internal static class Program
         });
         var page = await context.NewPageAsync();
 
-        Log($"Öffne {config.EnpalUrl} ...");
-        await page.GotoAsync(config.EnpalUrl, new PageGotoOptions
+        Log($"Öffne {config.DeviceMessagesUrl} ...");
+        await page.GotoAsync(config.DeviceMessagesUrl, new PageGotoOptions
         {
             WaitUntil = WaitUntilState.NetworkIdle,
             Timeout = 30_000,
         });
-        await page.Locator("#collectorLoadStateButton").WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 });
+        await page.Locator("input[id^=showInternal_]").First.WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 });
 
         Log("Verbindung steht, beginne mit periodischem Auslesen.");
 
+        // Stirbt der Blazor-Circuit, ohne dass die Seite das merkt, bleiben
+        // die Tabellenwerte einfach stehen - das wird hier an nicht mehr
+        // fortschreitenden Zeitstempeln erkannt und fuehrt zum Neustart.
+        var staleAfter = TimeSpan.FromSeconds(Math.Max(300, 3 * config.PollIntervalSeconds));
+        var newestTimestamp = DateTimeOffset.MinValue;
+        var lastProgress = DateTimeOffset.UtcNow;
+
         while (!token.IsCancellationRequested)
         {
-            var json = await LoadCollectorStateAsync(page);
-            var readings = ParseCollectorState(json);
-            Log($"{readings.Count} Sensorwerte aus Collector-JSON geparst.");
+            await EnsureAllValuesVisibleAsync(page);
+            var readings = await ReadDeviceMessagesAsync(page);
+            if (readings.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    "Keine Sensorwerte in den deviceMessages-Tabellen gefunden - Verbindung verloren oder Seite geändert.");
+            }
+            Log($"{readings.Count} Sensorwerte aus deviceMessages gelesen.");
+
+            var newest = readings.Max(r => r.Timestamp);
+            if (newest > newestTimestamp)
+            {
+                newestTimestamp = newest;
+                lastProgress = DateTimeOffset.UtcNow;
+            }
+            else if (DateTimeOffset.UtcNow - lastProgress > staleAfter)
+            {
+                throw new InvalidOperationException(
+                    $"Seit {staleAfter.TotalMinutes:0} min keine neuen Werte (neuester Zeitstempel {newestTimestamp:u}) - Verbindung vermutlich tot.");
+            }
 
             foreach (var reading in readings)
             {
@@ -131,65 +159,103 @@ internal static class Program
         }
     }
 
-    // Liest den Monaco-Editor-Inhalt der Collector-Seite aus - siehe
-    // window.monaco JS-API, mit der die Seite den Editor selbst befuellt.
-    private const string GetEditorValueScript =
-        "() => (window.monaco && monaco.editor.getModels().length) ? monaco.editor.getModels()[0].getValue() : null";
+    // Alle Checkboxen ausser "Show unsupported values" (blendet nur Zeilen
+    // ohne Wert ein): Geraeteauswahl (SiteData, Battery, ...) und "Show
+    // internal values" pro Geraet.
+    private const string UncheckedValueCheckboxSelector =
+        "input[type=checkbox]:not([id^=showUnsupported_]):not(:checked)";
 
     /// <summary>
-    /// Klickt "Load Current Collector State" und wartet, bis der Monaco-
-    /// Editor daraufhin (per Blazor-Server-Roundtrip) mit JSON befuellt
-    /// wurde.
+    /// Hakt alle noch nicht gesetzten Checkboxen an. Wird vor jedem Poll
+    /// aufgerufen, da die Seite nach einem Verbindungsabbruch per eigenem
+    /// Reconnect-Handler neu laedt und die Checkboxen dann wieder leer sind.
+    /// Nach einem Klick immer wieder das erste ungesetzte Element neu
+    /// suchen, da das Anhaken eines Geraets weitere Checkboxen einfuegt.
     /// </summary>
-    private static async Task<string> LoadCollectorStateAsync(IPage page)
+    private static async Task EnsureAllValuesVisibleAsync(IPage page)
     {
-        await page.Locator("#collectorLoadStateButton").ClickAsync();
-
-        for (var attempt = 0; attempt < 10; attempt++)
+        var uncheckedBoxes = page.Locator(UncheckedValueCheckboxSelector);
+        var changed = false;
+        for (var i = 0; i < 50 && await uncheckedBoxes.CountAsync() > 0; i++)
         {
-            await page.WaitForTimeoutAsync(500);
-            var content = await page.EvaluateAsync<string?>(GetEditorValueScript);
-            if (!string.IsNullOrWhiteSpace(content) && content.TrimStart().StartsWith('{'))
-            {
-                return content;
-            }
+            await uncheckedBoxes.First.CheckAsync();
+            changed = true;
         }
 
-        throw new InvalidOperationException("Kein Collector-JSON erhalten - Verbindung vermutlich verloren.");
+        if (changed)
+        {
+            // Blazor-Roundtrip abwarten, bis die zusaetzlichen Zeilen da sind.
+            await page.WaitForTimeoutAsync(2000);
+        }
     }
 
-    private static readonly JsonSerializerOptions CollectorJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-    };
+    // Liefert pro Tabellenzeile [Name, Wert, Zeitstempel]. Zeilen ohne Wert
+    // ("missing: ...", "unsupported: ...") bestehen nur aus Name + einer
+    // Notiz-Zelle mit colspan und fallen durch den Filter.
+    private const string ReadTableRowsScript = """
+        () => [...document.querySelectorAll('table tbody tr')]
+            .map(tr => [...tr.cells].map(td => td.innerText.trim()))
+            .filter(cells => cells.length >= 3 && cells[0] && cells[1])
+            .map(cells => cells.slice(0, 3))
+        """;
 
     /// <summary>
-    /// Extrahiert alle Sensorwerte aus den Geraete-Sektionen
-    /// (DeviceCollections[].numberDataPoints/textDataPoints) des Collector-
-    /// JSON. Mehrere Geraete spiegeln teils dieselben Werte (z.B. Batterie-
-    /// Werte tauchen sowohl bei "Battery" als auch bei "Inverter" auf) -
-    /// bei doppelten Sensornamen gewinnt der letzte Eintrag, die Werte sind
+    /// Liest alle Sensorwerte aus den Geraete-Tabellen. Mehrere Geraete
+    /// spiegeln teils dieselben Werte (z.B. Power.AC.Max.Battery) - bei
+    /// doppelten Sensornamen gewinnt der letzte Eintrag, die Werte sind
     /// ohnehin identisch.
     /// </summary>
-    private static List<SensorReading> ParseCollectorState(string json)
+    private static async Task<List<SensorReading>> ReadDeviceMessagesAsync(IPage page)
     {
-        var state = JsonSerializer.Deserialize<CollectorState>(json, CollectorJsonOptions);
+        var rows = await page.EvaluateAsync<string[][]>(ReadTableRowsScript);
+        var nowUtc = DateTimeOffset.UtcNow;
         var readings = new Dictionary<string, SensorReading>();
 
-        foreach (var device in state?.DeviceCollections ?? [])
+        foreach (var row in rows ?? [])
         {
-            foreach (var (name, point) in device.NumberDataPoints ?? [])
-            {
-                readings[name] = new SensorReading(name, point.Value, point.Unit, point.Timestamp);
-            }
-
-            foreach (var (name, point) in device.TextDataPoints ?? [])
-            {
-                readings[name] = new SensorReading(name, point.Value, point.Unit, point.Timestamp);
-            }
+            var (value, unit) = ParseValue(row[1]);
+            readings[row[0]] = new SensorReading(row[0], value, unit, ParseTimestamp(row[2], nowUtc));
         }
 
         return [.. readings.Values];
+    }
+
+    // Zahl mit optionaler, direkt angehaengter Einheit: "389W", "-0.6A",
+    // "75%", "46.8°C", "17299.24kWh", "-101". Alles andere (z.B.
+    // "Running (2)", Seriennummern, ISO-Datumswerte) bleibt Text.
+    private static readonly Regex NumberWithUnit = new(@"^(-?\d+(?:\.\d+)?)\s*([A-Za-z%°]{0,4})$");
+
+    private static (object Value, string Unit) ParseValue(string text)
+    {
+        var match = NumberWithUnit.Match(text);
+        if (match.Success && double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var number))
+        {
+            return (number, match.Groups[2].Value);
+        }
+
+        return (text, "");
+    }
+
+    /// <summary>
+    /// SiteData liefert vollstaendige UTC-Zeitstempel ("2026-09-30
+    /// 17:17:29.398Z"), die Geraete-Tabellen nur die UTC-Uhrzeit
+    /// ("17:17:29.38") - die wird auf heute gesetzt bzw. auf gestern, falls
+    /// sie sonst (kurz nach Mitternacht) in der Zukunft laege.
+    /// </summary>
+    private static DateTimeOffset ParseTimestamp(string text, DateTimeOffset nowUtc)
+    {
+        if (TimeSpan.TryParseExact(text, [@"hh\:mm\:ss\.FFF", @"hh\:mm\:ss"], CultureInfo.InvariantCulture, out var timeOfDay))
+        {
+            var timestamp = new DateTimeOffset(nowUtc.UtcDateTime.Date + timeOfDay, TimeSpan.Zero);
+            return timestamp > nowUtc.AddMinutes(5) ? timestamp.AddDays(-1) : timestamp;
+        }
+
+        if (DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var full))
+        {
+            return full;
+        }
+
+        return nowUtc;
     }
 
     private static void Log(string message) =>
@@ -197,23 +263,6 @@ internal static class Program
 }
 
 internal sealed record SensorReading(string Name, object Value, string Unit, DateTimeOffset Timestamp);
-
-internal sealed record CollectorState(
-    [property: JsonPropertyName("DeviceCollections")] List<DeviceCollection>? DeviceCollections);
-
-internal sealed record DeviceCollection(
-    [property: JsonPropertyName("numberDataPoints")] Dictionary<string, NumberDataPoint>? NumberDataPoints,
-    [property: JsonPropertyName("textDataPoints")] Dictionary<string, TextDataPoint>? TextDataPoints);
-
-internal sealed record NumberDataPoint(
-    [property: JsonPropertyName("timeStampUtcOfMeasurement")] DateTimeOffset Timestamp,
-    [property: JsonPropertyName("unit")] string Unit,
-    [property: JsonPropertyName("value")] double Value);
-
-internal sealed record TextDataPoint(
-    [property: JsonPropertyName("timeStampUtcOfMeasurement")] DateTimeOffset Timestamp,
-    [property: JsonPropertyName("unit")] string Unit,
-    [property: JsonPropertyName("value")] string Value);
 
 internal sealed class BridgeConfig
 {
@@ -230,11 +279,16 @@ internal sealed class BridgeConfig
     public required bool HaDiscoveryEnabled { get; init; }
     public required string HaDiscoveryPrefix { get; init; }
 
+    // ENPAL_URL darf die Basis-URL der Box oder eine beliebige Seite darauf
+    // sein - ein Pfad (z.B. das fruehere "/collector" aus aelteren .env-
+    // Dateien) wird ignoriert, gelesen wird immer "/deviceMessages".
+    public string DeviceMessagesUrl => new Uri(new Uri(EnpalUrl), "/deviceMessages").ToString();
+
     public static BridgeConfig FromEnvironment()
     {
         return new BridgeConfig
         {
-            EnpalUrl = GetEnv("ENPAL_URL", "http://10.1.2.11/collector"),
+            EnpalUrl = GetEnv("ENPAL_URL", "http://10.1.2.11"),
             MqttHost = GetEnv("MQTT_HOST", "localhost"),
             MqttPort = int.TryParse(GetEnv("MQTT_PORT", "1883"), out var p) ? p : 1883,
             MqttUsername = Environment.GetEnvironmentVariable("MQTT_USERNAME"),
@@ -252,7 +306,7 @@ internal sealed class BridgeConfig
     public void LogSummary()
     {
         Console.WriteLine(
-            $"Konfiguration: ENPAL_URL={EnpalUrl}, MQTT={MqttHost}:{MqttPort}, " +
+            $"Konfiguration: Seite={DeviceMessagesUrl}, MQTT={MqttHost}:{MqttPort}, " +
             $"Topic-Prefix={MqttTopicPrefix}, Intervall={PollIntervalSeconds}s, " +
             $"MQTT-Operation-Timeout={MqttOperationTimeoutSeconds}s, " +
             $"HA-Discovery={(HaDiscoveryEnabled ? $"an ({HaDiscoveryPrefix})" : "aus")}");
@@ -360,9 +414,9 @@ internal sealed class MqttPublisher
             "V" => ("V", "voltage", "measurement"),
             "A" => ("A", "current", "measurement"),
             "Hz" => ("Hz", "frequency", "measurement"),
-            "Celcius" => ("°C", "temperature", "measurement"),
-            "Percent" when reading.Name == "Energy.Battery.Charge.Level" => ("%", "battery", "measurement"),
-            "Percent" => ("%", null, "measurement"),
+            "°C" => ("°C", "temperature", "measurement"),
+            "%" when reading.Name == "Energy.Battery.Charge.Level" => ("%", "battery", "measurement"),
+            "%" => ("%", null, "measurement"),
             _ => (null, null, null),
         };
     }

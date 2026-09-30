@@ -1,16 +1,21 @@
 # Enpal MQTT Bridge
 
-Liest die Enpal-Box-Seite `collector` per echtem Headless-Browser
-(Playwright/Chromium) aus: ein Klick auf „Load Current Collector State"
-liefert ein vollständiges JSON mit allen Sensorwerten - inklusive der
-Werte, die auf der `deviceMessages`-Seite erst nach Anhaken von „Show
-internal values" / „Show unsupported values" sichtbar wären
-(Batterie-Ladezustand/SOC, Batterie laden/entladen, PV-DC-Leistung, ...).
-Dieser Button hängt an einer aktiven Blazor-Server-Verbindung
-(SignalR-Circuit) und ist deshalb per einfachem HTTP-GET/Scraping nicht
+Liest die Enpal-Box-Seite `deviceMessages` per echtem Headless-Browser
+(Playwright/Chromium) aus: die Seite zeigt pro Gerät (SiteData, Battery,
+IoTEdgeDevice, PowerSensor, Inverter) eine Tabelle mit allen
+Sensorwerten. Die Bridge hakt dort „Show internal values" an, damit auch
+Batterie-Ladezustand/SOC, Batterie laden/entladen, PV-DC-Leistung usw.
+erscheinen, und liest die Tabellen danach periodisch aus. Checkboxen und
+Live-Aktualisierung hängen an einer aktiven Blazor-Server-Verbindung
+(SignalR-Circuit) und sind deshalb per einfachem HTTP-GET/Scraping nicht
 erreichbar - deshalb hier ein echter Browser statt eines HTML-Parsers.
-Die Sensornamen im JSON (z.B. `Energy.Battery.Charge.Level`) entsprechen
-denen der bisherigen `deviceMessages`-Tabelle.
+
+> Bis Firmware **Solar Rel. 8.51.4** (ausgerollt am 30.09.2026) las die
+> Bridge stattdessen die Seite `collector` („Load Current Collector
+> State"). Die hat Enpal mit diesem Update entfernt, `/collector` leitet
+> seitdem auf `/` um. Sensornamen (z.B. `Energy.Battery.Charge.Level`)
+> sind unverändert; die Einheiten im Payload lauten jetzt so, wie die
+> Seite sie anzeigt (`%` statt `Percent`, `°C` statt `Celcius`).
 
 Die gefundenen Werte werden per MQTT veröffentlicht. Zusätzlich sendet die
 Bridge für jeden Sensor eine Home-Assistant-MQTT-Discovery-Konfiguration
@@ -20,13 +25,12 @@ Objekte inkl. Name, Einheit und Gerätklasse automatisch anlegt - siehe
 
 ## Wichtiger Hinweis zum Testgrad
 
-- **Ende-zu-Ende gegen die echte Box getestet (linux/amd64):** Läuft auf
-  .NET 10 (SDK/Runtime), Microsoft.Playwright 1.62.0 und MQTTnet 5.2.0.
-  `dotnet build`/`dotnet publish`, `docker build` und ein kompletter Lauf
-  gegen eine echte Enpal-Box + einen lokalen Test-Broker wurden erfolgreich
-  durchgeführt: der „Load Current Collector State"-Button liefert
-  zuverlässig alle ~69 Sensorwerte (Zahlen wie Text) pro Zyklus, und die
-  MQTT-Payloads kommen korrekt formatiert an.
+- **Ende-zu-Ende gegen die echte Box getestet (Firmware 8.51.4):** Läuft
+  auf .NET 10 (SDK/Runtime), Microsoft.Playwright 1.62.0 und MQTTnet 5.2.0.
+  Ein kompletter Lauf gegen eine echte Enpal-Box + einen lokalen
+  Test-Broker liefert ~119 Sensorwerte (Zahlen wie Text) pro Zyklus, die
+  sich zwischen den Zyklen live aktualisieren, und die MQTT-Payloads kommen
+  korrekt formatiert an.
 - **linux/arm64 (z.B. Raspberry Pi 3, 64-bit OS) - Build verifiziert,
   Laufzeit nicht auf echter Hardware getestet:** Das Image wird als
   Multi-Platform-Manifest (amd64 + arm64) gebaut, siehe
@@ -53,17 +57,23 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-Beim Start öffnet die Bridge die Collector-Seite der Enpal-Box und klickt
-danach alle `POLL_INTERVAL_SECONDS` Sekunden erneut auf „Load Current
-Collector State", um den zuletzt von der Box gesammelten Sensorstand als
-JSON abzuholen und zu veröffentlichen. Das ist bewusst der passive
-„Load State"-Button statt „Run Collection Cycle" - die Bridge erzwingt
-also keine zusätzliche Geräte-Kommunikation, sondern liest nur aus, was
-die Box ohnehin laufend selbst einsammelt.
+`ENPAL_URL` ist die Basis-URL der Box (z.B. `http://10.1.2.11`); ein Pfad
+dahinter wird ignoriert, ältere `.env`-Dateien mit `.../collector`
+funktionieren also unverändert weiter.
+
+Beim Start öffnet die Bridge die `deviceMessages`-Seite der Enpal-Box,
+hakt alle Geräte und „Show internal values" an und liest danach alle
+`POLL_INTERVAL_SECONDS` Sekunden die (von der Box live aktualisierten)
+Tabellen aus. Die Bridge erzwingt dabei keine zusätzliche
+Geräte-Kommunikation, sondern liest nur aus, was die Box ohnehin laufend
+selbst einsammelt. Zeilen ohne Wert („missing: ...", „unsupported: ...")
+werden übersprungen.
 
 Bricht die Verbindung ab (z.B. Netzwerkproblem, Box-Neustart), startet
 die Bridge nach `RESTART_DELAY_SECONDS` automatisch eine komplett neue
-Sitzung (neuer Browser, neue Verbindung).
+Sitzung (neuer Browser, neue Verbindung). Dasselbe passiert, wenn
+mindestens 5 Minuten lang kein Wert einen neueren Zeitstempel bekommt
+(Verbindung tot, ohne dass die Seite es merkt).
 
 Jeder MQTT-Connect/Publish wird nach `MQTT_OPERATION_TIMEOUT_SECONDS`
 (Default 20s) hart abgebrochen, falls der Broker nicht antwortet - ohne
@@ -81,7 +91,7 @@ mosquitto_sub -h <MQTT_HOST> -t 'enpal/#' -v
 Jede Nachricht ist ein JSON-Objekt, z.B.:
 
 ```text
-enpal/Energy.Battery.Charge.Level {"value":96,"unit":"Percent","timestamp":1734000005}
+enpal/Energy.Battery.Charge.Level {"value":75,"unit":"%","timestamp":1790788907}
 ```
 
 ## Home-Assistant-MQTT-Discovery
@@ -102,7 +112,7 @@ Alle Sensoren landen dadurch unter einem gemeinsamen Gerät „Enpal Solar".
 `unit_of_measurement`/`device_class`/`state_class` werden automatisch aus
 der von der Box gelieferten Einheit abgeleitet (W/kW → `power`, Wh/kWh →
 `energy` + `total_increasing`, V → `voltage`, A → `current`, Hz →
-`frequency`, Celcius → `temperature`, der Batterie-Ladestand zusätzlich als
+`frequency`, °C → `temperature`, der Batterie-Ladestand zusätzlich als
 `battery`); Text-Sensoren (LTE-Status etc.) bleiben unklassifiziert.
 
 Die Bridge setzt außerdem einen Verfügbarkeits-Status unter `enpal/status`
@@ -152,7 +162,7 @@ docker-compose.yml        Startet den Container mit den Werten aus .env.
 .env.example               Vorlage für die Konfiguration.
 EnpalMqttBridge.csproj     Projektdatei (Microsoft.Playwright, MQTTnet).
 Program.cs                 Kompletter Bridge-Code (Browser-Steuerung,
-                            Collector-JSON-Parsing, MQTT-Publisher,
+                            Tabellen-Parsing, MQTT-Publisher,
                             Reconnect-Logik).
 VERSION                    Aktuelle Image-Version (SemVer), wird von
                             build-and-push.ps1 automatisch hochgezählt.
@@ -162,12 +172,11 @@ build-and-push.ps1         Baut das Docker-Image mit hochgezählter
 
 ## Falls Enpal die Seite nochmal ändert
 
-Die Bridge klickt gezielt auf `#collectorLoadStateButton` auf der
-`collector`-Seite und liest danach den Inhalt des Monaco-Editors aus
-(`window.monaco.editor.getModels()[0].getValue()`) - das erwartete JSON
-enthält unter `DeviceCollections[].numberDataPoints` /
-`DeviceCollections[].textDataPoints` je Gerät die Sensorwerte (Name ->
-`{timeStampUtcOfMeasurement, unit, value}`). Ändert sich die Seite oder
-das JSON-Format erneut, zuerst per `docker compose logs -f` schauen, wie
-viele Sensorwerte pro Zyklus erkannt werden, und bei Bedarf den Selektor/
-das JSON-Mapping in `Program.cs` anpassen.
+Die Bridge öffnet `/deviceMessages`, hakt alle Checkboxen außer
+`showUnsupported_*` an (Geräteauswahl + `showInternal_<Gerät>`) und liest
+danach aus allen `table tbody tr` die ersten drei Zellen (Sensorname,
+Wert inkl. Einheit wie `389W`/`75%`/`46.8°C`, Zeitstempel). Ändert sich
+die Seite erneut, zuerst per `docker compose logs -f` schauen, wie viele
+Sensorwerte pro Zyklus erkannt werden bzw. welcher Fehler beim Start
+kommt, dann im Browser unter `http://<box>/` nachsehen, welche Seiten es
+noch gibt, und die Selektoren in `Program.cs` anpassen.
