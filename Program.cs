@@ -59,7 +59,11 @@ internal static class Program
             {
                 await RunSessionAsync(config, mqtt, cts.Token);
             }
-            catch (OperationCanceledException) when (cts.Token.IsCancellationRequested)
+            // Beim Herunterfahren beendet das Signal oft auch Chromium, bevor
+            // die Sitzung selbst den Abbruch bemerkt - dann kommt statt
+            // OperationCanceledException z.B. TargetClosedException. Das ist
+            // kein Sitzungsfehler.
+            catch (Exception) when (cts.Token.IsCancellationRequested)
             {
                 break;
             }
@@ -110,6 +114,20 @@ internal static class Program
         });
         var page = await context.NewPageAsync();
 
+        // Die Seite kommt zunaechst serverseitig vorgerendert (statisches
+        // HTML) - Klicks auf die Checkboxen gehen verloren, bis der Blazor-
+        // Circuit per WebSocket steht. "NetworkIdle" wartet nicht auf
+        // WebSockets, deshalb hier explizit auf die erste Antwort des
+        // Blazor-Hubs warten.
+        var circuitConnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        page.WebSocket += (_, webSocket) =>
+        {
+            if (webSocket.Url.Contains("/_blazor", StringComparison.OrdinalIgnoreCase))
+            {
+                webSocket.FrameReceived += (_, _) => circuitConnected.TrySetResult();
+            }
+        };
+
         Log($"Öffne {config.DeviceMessagesUrl} ...");
         await page.GotoAsync(config.DeviceMessagesUrl, new PageGotoOptions
         {
@@ -117,6 +135,9 @@ internal static class Program
             Timeout = 30_000,
         });
         await page.Locator("input[id^=showInternal_]").First.WaitForAsync(new LocatorWaitForOptions { Timeout = 15_000 });
+        await circuitConnected.Task.WaitAsync(TimeSpan.FromSeconds(15), token);
+        // Erster Interaktiv-Render nach dem Circuit-Handshake.
+        await page.WaitForTimeoutAsync(1000);
 
         Log("Verbindung steht, beginne mit periodischem Auslesen.");
 
@@ -184,7 +205,11 @@ internal static class Program
 
         if (changed)
         {
-            // Blazor-Roundtrip abwarten, bis die zusaetzlichen Zeilen da sind.
+            // Die Seite zeichnet die Tabellen erst beim naechsten Datenpaket
+            // der Box neu (je nach Geraet 1-20s) - bis dahin fehlen die
+            // internen Werte bzw. frisch verbundene Geraete stehen noch auf
+            // "No messages available". Die ersten ein, zwei Polls nach dem
+            // Start veroeffentlichen deshalb ggf. nur einen Teil der Werte.
             await page.WaitForTimeoutAsync(2000);
         }
     }
