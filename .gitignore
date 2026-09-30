@@ -482,3 +482,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# LXC-Tarballs aus build-and-push.ps1
+dist/

@@ -2,6 +2,11 @@
 Baut das Docker-Image fuer linux/amd64 + linux/arm64 (z.B. Raspberry Pi 3
 64-bit) mit einer um 1 erhoehten Patch-Version (aus VERSION), taggt es als
 Version und als "latest" und laedt beide Tags direkt zu ghcr.io hoch.
+
+Zusaetzlich werden self-contained Tarballs (linux-x64/linux-arm64) fuer die
+LXC-Installation (lxc/install.sh) gebaut und als GitHub-Release
+"v<Version>" veroeffentlicht - install.sh laedt immer das neueste Release.
+Voraussetzung: gh CLI angemeldet und der aktuelle Commit bereits gepusht.
 #>
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +33,16 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($revision)) {
 }
 $created = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
+# Das GitHub-Release wird auf genau diesen Commit getaggt - der muss dafuer
+# schon auf GitHub liegen. Vor dem Bauen pruefen, statt erst nach dem
+# Docker-Push zu scheitern.
+$commit = git rev-parse HEAD
+git fetch --quiet origin
+$remoteBranches = git branch -r --contains $commit
+if ([string]::IsNullOrWhiteSpace($remoteBranches)) {
+    throw "Commit $revision ist noch nicht auf GitHub (git push) - das Release braucht ihn als Tag-Ziel."
+}
+
 # --- Buildx-Builder mit Multi-Platform-Push-Unterstuetzung sicherstellen ---
 # Der Standard-"docker"-Treiber kann kein Multi-Platform-Manifest in einem
 # Durchgang erzeugen/pushen ("Multi-platform build is not supported for the
@@ -42,6 +57,24 @@ if ($LASTEXITCODE -ne 0) {
         throw "Konnte Buildx-Builder '$builderName' nicht erstellen (Exit-Code $LASTEXITCODE)"
     }
 }
+
+# --- LXC-Tarballs bauen (vor dem Docker-Push, damit ein Fehler hier nichts
+# halb veroeffentlicht) ---
+$distDir = Join-Path $scriptDir "dist"
+if (Test-Path $distDir) {
+    Remove-Item -Recurse -Force $distDir
+}
+Write-Host "Baue LXC-Tarballs Version $newVersion ..."
+docker buildx build `
+    --builder $builderName `
+    --target lxc-tarballs `
+    --build-arg "VERSION=$newVersion" `
+    --output "type=local,dest=$distDir" `
+    $scriptDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Bau der LXC-Tarballs fehlgeschlagen (Exit-Code $LASTEXITCODE) - VERSION bleibt auf $currentVersion."
+}
+$tarballs = Get-ChildItem $distDir -Filter "enpal-mqtt-bridge-*.tar.gz" | ForEach-Object { $_.FullName }
 
 Write-Host "Baue und pushe $imageName Version $newVersion fuer $platforms (Revision $revision) ..."
 
@@ -65,3 +98,15 @@ if ($LASTEXITCODE -ne 0) {
 Set-Content -Path $versionFile -Value $newVersion -NoNewline -Encoding utf8
 
 Write-Host "Fertig: ${imageName}:$newVersion ($platforms) wurde gebaut und hochgeladen."
+
+# --- GitHub-Release mit den LXC-Tarballs ---
+Write-Host "Erstelle GitHub-Release v$newVersion mit LXC-Tarballs ..."
+gh release create "v$newVersion" @tarballs `
+    --target $commit `
+    --title "v$newVersion" `
+    --notes "Docker: ``${imageName}:$newVersion`` - LXC: siehe README (lxc/create-lxc.sh bzw. lxc/install.sh)."
+if ($LASTEXITCODE -ne 0) {
+    throw "GitHub-Release fehlgeschlagen (Exit-Code $LASTEXITCODE) - Docker-Image ist bereits veroeffentlicht. Manuell nachholen: gh release create v$newVersion $($tarballs -join ' ') --target $commit"
+}
+
+Write-Host "Fertig: GitHub-Release v$newVersion veroeffentlicht."

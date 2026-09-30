@@ -31,6 +31,10 @@ Objekte inkl. Name, Einheit und Gerätklasse automatisch anlegt - siehe
   Test-Broker liefert ~119 Sensorwerte (Zahlen wie Text) pro Zyklus, die
   sich zwischen den Zyklen live aktualisieren, und die MQTT-Payloads kommen
   korrekt formatiert an.
+- **Proxmox-LXC (`lxc/`) - teilweise getestet:** `install.sh` wurde in
+  einem frischen Debian-12-Container (x64) getestet (Neuinstallation und
+  Update, Bridge als Dienstbenutzer gegen die echte Box); `create-lxc.sh`
+  (`pct`/`pveam`-Teil) ist noch nicht auf einem echten Proxmox-Host gelaufen.
 - **linux/arm64 (z.B. Raspberry Pi 3, 64-bit OS) - Build verifiziert,
   Laufzeit nicht auf echter Hardware getestet:** Das Image wird als
   Multi-Platform-Manifest (amd64 + arm64) gebaut, siehe
@@ -81,6 +85,47 @@ diesen Timeout kann eine TCP-Verbindung, die weder sauber abgelehnt noch
 beantwortet wird, die Bridge stunden- statt sekundenlang blockieren, da
 MQTTnets eingebautes Timeout (Default 100s) diesen Fall nicht zuverlässig
 abdeckt.
+
+## Alternativ: als Proxmox-LXC (ohne Docker)
+
+Ähnlich wie die [Proxmox VE Community Scripts](https://community-scripts.github.io/ProxmoxVE/):
+ein Befehl in der **Proxmox-Shell** (Web-UI → Node → Shell) legt einen
+Debian-12-Container an, installiert darin Bridge + Chromium und startet sie
+als systemd-Dienst:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/BlackOrca/EnpalMqttBridge/main/lxc/create-lxc.sh)"
+```
+
+Das Skript fragt nach IP der Enpal-Box und MQTT-Broker (+ ggf.
+Zugangsdaten) und bietet optional erweiterte Container-Einstellungen an
+(ID, Speicher, Netzwerk/statische IP, ...). Standard: unprivilegierter
+Container, 2 Kerne, 1 GB RAM, 512 MB Swap, 4 GB Disk, DHCP auf `vmbr0`,
+Autostart beim Booten des Hosts.
+
+Wer den Container lieber selbst anlegt (Debian 12/Ubuntu, unprivilegiert,
+≥ 1 GB RAM), führt **in dessen Konsole** nur die Installation aus:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/BlackOrca/EnpalMqttBridge/main/lxc/install.sh)"
+```
+
+Im Container dann:
+
+| Was | Befehl |
+| --- | --- |
+| Logs anzeigen | `journalctl -u enpal-mqtt-bridge -f` |
+| Konfiguration | `/etc/enpal-mqtt-bridge/bridge.env` (gleiche Werte wie `.env.example`), danach `systemctl restart enpal-mqtt-bridge` |
+| Update auf neueste Version | `enpal-bridge-update` (Konfiguration bleibt erhalten) |
+
+Vom Proxmox-Host aus geht das jeweils mit vorangestelltem
+`pct exec <CTID> -- ...`.
+
+Die Bridge kommt als fertiges, self-contained Paket (inkl. .NET-Runtime)
+aus dem neuesten [GitHub-Release](https://github.com/BlackOrca/EnpalMqttBridge/releases);
+Chromium installiert `install.sh` passend zur Playwright-Version der
+Bridge. `build-and-push.ps1` erstellt diese Releases automatisch zusammen
+mit dem Docker-Image.
 
 ## 2. Werte manuell prüfen
 
