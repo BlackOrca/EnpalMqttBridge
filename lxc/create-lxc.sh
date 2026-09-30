@@ -66,6 +66,17 @@ if [ -n "${MQTT_USERNAME:-}" ]; then
     ask_secret MQTT_PASSWORD "MQTT-Passwort"
 fi
 
+# Wie bei den Community-Scripts: ohne Passwort meldet die Proxmox-Konsole
+# automatisch als root an (Zugriff darauf haben ohnehin nur PVE-Admins).
+if [ -z "${CT_PASSWORD+x}" ]; then
+    ask_secret CT_PASSWORD "Root-Passwort fuer den Container (leer = automatische Anmeldung an der Konsole)"
+    if [ -n "$CT_PASSWORD" ]; then
+        ask_secret CT_PASSWORD_CONFIRM "Root-Passwort wiederholen"
+        [ "$CT_PASSWORD" = "$CT_PASSWORD_CONFIRM" ] || die "Passwoerter stimmen nicht ueberein."
+        [ "${#CT_PASSWORD}" -ge 5 ] || die "Root-Passwort muss mindestens 5 Zeichen haben (Proxmox-Vorgabe)."
+    fi
+fi
+
 # --- Container-Einstellungen (Standardwerte oder erweitert) ---
 DEFAULT_STORAGE=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}' \
     | { grep -x local-lvm || true; } | head -n1)
@@ -135,8 +146,19 @@ pct create "$CTID" "$TEMPLATE_STORAGE:vztmpl/$TEMPLATE" \
     --rootfs "$CT_STORAGE:$DISK_GB" \
     --net0 "$NET0" \
     --timezone host \
+    ${CT_PASSWORD:+--password "$CT_PASSWORD"} \
     --onboot 1 >/dev/null
 pct start "$CTID"
+
+if [ -z "${CT_PASSWORD:-}" ]; then
+    msg "Richte automatische root-Anmeldung an der Proxmox-Konsole ein ..."
+    pct exec "$CTID" -- bash -c 'mkdir -p /etc/systemd/system/container-getty@1.service.d && cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<"EOF"
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM
+EOF
+systemctl daemon-reload && systemctl restart container-getty@1.service'
+fi
 
 msg "Warte auf Netzwerk im Container ..."
 for _ in $(seq 1 30); do

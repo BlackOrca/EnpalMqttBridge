@@ -103,6 +103,12 @@ Zugangsdaten) und bietet optional erweiterte Container-Einstellungen an
 Container, 2 Kerne, 1 GB RAM, 512 MB Swap, 4 GB Disk, DHCP auf `vmbr0`,
 Autostart beim Booten des Hosts.
 
+Zusätzlich fragt es nach einem Root-Passwort für den Container. Bleibt es
+leer, meldet die Proxmox-Konsole (Web-UI → Container → Console)
+automatisch als `root` an - wie bei den Community-Scripts. Nachträglich
+setzen/ändern lässt sich das Passwort vom Host aus mit
+`pct exec <CTID> -- passwd`.
+
 Wer den Container lieber selbst anlegt (Debian 12/Ubuntu, unprivilegiert,
 ≥ 1 GB RAM), führt **in dessen Konsole** nur die Installation aus:
 
